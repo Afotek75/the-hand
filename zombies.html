@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Hand: Zombie Zone</title>
+<style>
+:root{--bg:#121830;--ink:#f4efe6;--accent:#ffd166}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,sans-serif}
+body{display:flex;flex-direction:column;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+header{padding:10px 16px;font-weight:800;font-size:20px}
+#stage{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#000}
+canvas,#preview{max-width:100%;max-height:100%}
+#preview{display:none}
+video#cam{display:none}
+#msg{position:absolute;left:12px;right:12px;bottom:12px;font-size:13px;background:rgba(0,0,0,.6);padding:8px 12px;border-radius:12px}
+#intro{position:absolute;inset:0;background:rgba(10,14,30,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;gap:12px}
+#intro h1{margin:0;font-size:30px}
+#intro p{margin:0;max-width:340px;font-size:15px;line-height:1.45;opacity:.9}
+.bar{display:flex;gap:8px;padding:10px 12px;justify-content:center;flex-wrap:wrap}
+button,a.btn{border:0;border-radius:99px;padding:12px 18px;font:600 15px system-ui;background:#2b3563;color:#fff;text-decoration:none;cursor:pointer}
+button.main{background:var(--accent);color:#1b2340}
+button.rec{background:#e4572e}
+button:disabled{opacity:.4}
+button:focus-visible,a:focus-visible{outline:3px solid #fff;outline-offset:2px}
+</style>
+</head>
+<body>
+<header>The Hand <span style="font-weight:500;opacity:.7;font-size:14px">Zombie Zone</span></header>
+<div id="stage">
+  <video id="cam" playsinline muted></video>
+  <canvas id="out"></canvas>
+  <video id="preview" controls playsinline></video>
+  <div id="msg">Loading…</div>
+  <div id="intro">
+    <h1>Zombie Zone</h1>
+    <p>Zombies spawn on the map around you and walk toward you. Aim with your <b>index finger</b>. Touch <b>thumb to middle finger</b> to fire. Turn around to find them.</p>
+    <p><b>Stay where you are.</b> Play standing still in a safe place. Don't walk while looking at the screen and stay away from roads.</p>
+    <button class="main" id="start">Start game</button>
+  </div>
+</div>
+<div class="bar">
+  <button id="left" disabled>◀ Turn</button>
+  <button id="right" disabled>Turn ▶</button>
+  <button id="flip" disabled>Flip</button>
+  <button id="rec" disabled>Record</button>
+  <a class="btn" id="dl" style="display:none" download="the-hand-clip">Save clip</a>
+  <button id="again" style="display:none">New clip</button>
+</div>
+
+<script type="module">
+import {HandLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+const $=id=>document.getElementById(id);
+const cam=$("cam"),cv=$("out"),ctx=cv.getContext("2d"),msg=$("msg"),preview=$("preview");
+const Z=18,FOV=65,D2R=Math.PI/180;
+let facing="environment",stream,lm,running=false,recorder,chunks=[],lastT=-1,inited=false;
+let anchor={lat:51.5074,lon:-0.1278},demo=true,P={x:0,y:0};
+let compass=0,off=0,hasCompass=false;
+let zs=[],hp=100,score=0,wave=0,toSpawn=0,spawnT=0,state="idle",lastShot=0,flash=0,dmg=0,prevT=0;
+const prevPin=[false,false];
+
+/* ---------- map ---------- */
+const mLon=()=>111320*Math.cos(anchor.lat*D2R);
+const curLat=()=>anchor.lat+P.y/110540;
+const curLon=()=>anchor.lon+P.x/mLon();
+const tiles=new Map();
+function tile(x,y){const k=x+"/"+y;let t=tiles.get(k);
+  if(!t){t=new Image();t.crossOrigin="anonymous";t.ok=false;t.onload=()=>t.ok=true;
+    t.src=`https://tile.openstreetmap.org/${Z}/${x}/${y}.png`;tiles.set(k,t)}return t}
+function worldPx(lat,lon){const n=256*2**Z,s=Math.sin(lat*D2R);
+  return{x:(lon+180)/360*n,y:(0.5-Math.log((1+s)/(1-s))/(4*Math.PI))*n}}
+function drawMap(cx,cy,r,H){
+  const lat=curLat(),wp=worldPx(lat,curLon());
+  const ppm=2**Z/(156543.03*Math.cos(lat*D2R));
+  ctx.save();ctx.beginPath();ctx.arc(cx,cy,r,0,7);ctx.clip();
+  ctx.fillStyle="#1b2340";ctx.fillRect(cx-r,cy-r,2*r,2*r);
+  for(let tx=Math.floor((wp.x-r)/256);tx<=Math.floor((wp.x+r)/256);tx++)
+    for(let ty=Math.floor((wp.y-r)/256);ty<=Math.floor((wp.y+r)/256);ty++){
+      const t=tile(tx,ty);if(t.ok)ctx.drawImage(t,tx*256-wp.x+cx,ty*256-wp.y+cy)}
+  ctx.fillStyle="rgba(0,0,0,.3)";ctx.fillRect(cx-r,cy-r,2*r,2*r);
+  ctx.fillStyle="rgba(255,255,255,.3)";ctx.beginPath();ctx.moveTo(cx,cy);
+  ctx.arc(cx,cy,r,(H-90-FOV/2)*D2R,(H-90+FOV/2)*D2R);ctx.fill();
+  ctx.fillStyle="#ff3b3b";
+  for(const z of zs){ctx.beginPath();ctx.arc(cx+(z.x-P.x)*ppm,cy-(z.y-P.y)*ppm,5,0,7);ctx.fill()}
+  ctx.fillStyle="#4cc9f0";ctx.beginPath();ctx.arc(cx,cy,6,0,7);ctx.fill();
+  ctx.restore();
+  ctx.lineWidth=3;ctx.strokeStyle="#fff";ctx.beginPath();ctx.arc(cx,cy,r,0,7);ctx.stroke();
+  ctx.fillStyle="#fff";ctx.font="11px system-ui";ctx.textAlign="center";
+  ctx.fillText("© OpenStreetMap contributors",cx,cy+r+14);ctx.textAlign="left";
+}
+
+/* ---------- sensors ---------- */
+function startGPS(){
+  if(!navigator.geolocation)return;
+  navigator.geolocation.watchPosition(p=>{
+    const lat=p.coords.latitude,lon=p.coords.longitude;
+    if(demo){anchor={lat,lon};P={x:0,y:0};demo=false;zs=[]}
+    else{P={x:(lon-anchor.lon)*mLon(),y:(lat-anchor.lat)*110540}}
+  },()=>{},{enableHighAccuracy:true,maximumAge:2000});
+}
+function onOri(e){
+  if(e.webkitCompassHeading!=null){compass=e.webkitCompassHeading;hasCompass=true}
+  else if(e.absolute&&e.alpha!=null){compass=360-e.alpha;hasCompass=true}
+}
+async function startOri(){
+  try{if(typeof DeviceOrientationEvent!=="undefined"&&DeviceOrientationEvent.requestPermission)
+    await DeviceOrientationEvent.requestPermission()}catch(e){}
+  addEventListener("deviceorientationabsolute",onOri,true);
+  addEventListener("deviceorientation",onOri,true);
+}
+$("left").onclick=()=>off-=15;$("right").onclick=()=>off+=15;
+addEventListener("keydown",e=>{if(e.key==="ArrowLeft")off-=15;if(e.key==="ArrowRight")off+=15});
+
+/* ---------- camera + model ---------- */
+async function loadModel(){
+  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  lm=await HandLandmarker.createFromOptions(fs,{
+    baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:"GPU"},
+    runningMode:"VIDEO",numHands:2});
+}
+async function openCam(){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:720},height:{ideal:1280}},audio:false});
+  cam.srcObject=stream;await cam.play();
+  cv.width=cam.videoWidth;cv.height=cam.videoHeight;
+}
+
+/* ---------- game ---------- */
+function reset(){zs=[];hp=100;score=0;wave=0;toSpawn=0;spawnT=0;state="play"}
+function spawn(){const a=Math.random()*6.283,d=30+Math.random()*20;
+  zs.push({x:P.x+Math.cos(a)*d,y:P.y+Math.sin(a)*d,hp:2,sp:1+Math.random()*.8+wave*.1,ph:Math.random()*6,box:null})}
+function update(dt){
+  if(toSpawn===0&&zs.length===0){wave++;toSpawn=3+2*wave;spawnT=1}
+  spawnT-=dt;if(toSpawn>0&&spawnT<=0){spawn();toSpawn--;spawnT=2.5}
+  zs=zs.filter(z=>{
+    const dx=P.x-z.x,dy=P.y-z.y,d=Math.hypot(dx,dy);
+    if(d<2){hp-=12;dmg=1;return false}
+    z.x+=dx/d*z.sp*dt;z.y+=dy/d*z.sp*dt;return true});
+  if(hp<=0){hp=0;state="over";running=false;
+    $("intro").style.display="flex";$("intro").querySelector("h1").textContent="Game over";
+    $("intro").querySelectorAll("p")[0].textContent="You survived to wave "+wave+" with a score of "+score+".";
+    $("start").textContent="Play again";$("start").disabled=false}
+}
+function shoot(x,y){
+  const n=performance.now();if(n-lastShot<300)return;lastShot=n;flash=1;
+  const hit=zs.filter(z=>z.box&&x>z.box.x&&x<z.box.x+z.box.w&&y>z.box.y&&y<z.box.y+z.box.h)
+    .sort((a,b)=>a.d-b.d)[0];
+  if(hit&&--hit.hp<=0){zs.splice(zs.indexOf(hit),1);score+=10}
+}
+function drawZ(z,sx,ht,cy,t){
+  const w=ht*.5,wob=Math.sin(t*3+z.ph)*ht*.03;
+  z.box={x:sx-w/2,y:cy-ht/2,w:w,h:ht};
+  ctx.fillStyle="#3d5a3a";ctx.fillRect(sx-ht*.15+wob,cy-ht*.17,ht*.3,ht*.45);
+  ctx.strokeStyle="#7bb661";ctx.lineWidth=ht*.07;ctx.lineCap="round";
+  ctx.beginPath();ctx.moveTo(sx-ht*.15+wob,cy-ht*.1);ctx.lineTo(sx-ht*.3,cy-ht*.3);
+  ctx.moveTo(sx+ht*.15+wob,cy-ht*.1);ctx.lineTo(sx+ht*.3,cy-ht*.3);ctx.stroke();
+  ctx.fillStyle="#7bb661";ctx.beginPath();ctx.arc(sx+wob,cy-ht*.32,ht*.14,0,7);ctx.fill();
+  ctx.fillStyle="#d00";ctx.beginPath();
+  ctx.arc(sx+wob-ht*.05,cy-ht*.33,ht*.025,0,7);ctx.arc(sx+wob+ht*.05,cy-ht*.33,ht*.025,0,7);ctx.fill();
+}
+function frame(){
+  if(!running)return;
+  if(cam.readyState>=2&&cam.currentTime!==lastT){
+    lastT=cam.currentTime;
+    const w=cv.width,h=cv.height,mirror=facing==="user",now=performance.now(),t=now/1000;
+    const dt=Math.min(.1,(now-prevT)/1000||0);prevT=now;
+    const X=p=>(mirror?1-p.x:p.x)*w,Y=p=>p.y*h;
+    const H=((compass+off)%360+360)%360;
+    ctx.save();if(mirror){ctx.translate(w,0);ctx.scale(-1,1)}
+    ctx.drawImage(cam,0,0,w,h);ctx.restore();
+    const hands=lm.detectForVideo(cam,performance.now()).landmarks;
+    if(state==="play")update(dt);
+
+    let L=0,R=0;
+    const list=zs.map(z=>{const dx=z.x-P.x,dy=z.y-P.y;
+      z.d=Math.hypot(dx,dy);z.rel=((Math.atan2(dx,dy)/D2R-H+540)%360)-180;z.box=null;return z}).sort((a,b)=>b.d-a.d);
+    for(const z of list){
+      if(Math.abs(z.rel)<FOV/2){
+        const sx=w/2+Math.tan(z.rel*D2R)/Math.tan(FOV/2*D2R)*w/2;
+        const ht=Math.max(50,Math.min(h*.7,h*5/z.d));
+        drawZ(z,sx,ht,h*.5,t);
+      }else{const k=Math.min(1,12/z.d);if(z.rel<0)L=Math.max(L,k);else R=Math.max(R,k)}
+    }
+    for(const [side,k] of [[0,L],[1,R]]){if(!k)continue;
+      const g=ctx.createLinearGradient(side?w:0,0,side?w-60:60,0);
+      g.addColorStop(0,`rgba(255,0,0,${.6*k})`);g.addColorStop(1,"rgba(255,0,0,0)");
+      ctx.fillStyle=g;ctx.fillRect(side?w-60:0,0,60,h)}
+
+    ctx.lineWidth=2;ctx.strokeStyle="rgba(255,255,255,.6)";
+    hands.forEach((hand,i)=>{
+      for(const c of HandLandmarker.HAND_CONNECTIONS){const a=hand[c.start],b=hand[c.end];
+        ctx.beginPath();ctx.moveTo(X(a),Y(a));ctx.lineTo(X(b),Y(b));ctx.stroke()}
+      const ax=X(hand[8]),ay=Y(hand[8]);
+      const fire=Math.hypot(X(hand[4])-X(hand[12]),Y(hand[4])-Y(hand[12]))<w*.06;
+      if(fire&&!prevPin[i]&&state==="play")shoot(ax,ay);
+      prevPin[i]=fire;
+      ctx.strokeStyle="#ff3b3b";ctx.lineWidth=3;ctx.beginPath();ctx.arc(ax,ay,22,0,7);
+      ctx.moveTo(ax-32,ay);ctx.lineTo(ax+32,ay);ctx.moveTo(ax,ay-32);ctx.lineTo(ax,ay+32);ctx.stroke();
+      if(flash>0){ctx.fillStyle=`rgba(255,220,100,${flash})`;ctx.beginPath();ctx.arc(ax,ay,30,0,7);ctx.fill()}
+      ctx.strokeStyle="rgba(255,255,255,.6)";ctx.lineWidth=2;
+    });
+    if(hands.length<2)prevPin[1]=false;if(!hands.length)prevPin[0]=false;
+    flash=Math.max(0,flash-.12);
+    if(dmg>0){ctx.fillStyle=`rgba(255,0,0,${dmg*.4})`;ctx.fillRect(0,0,w,h);dmg=Math.max(0,dmg-.05)}
+
+    const r=Math.min(w,h)*.15;drawMap(w-r-14,r+14,r,H);
+    ctx.fillStyle="rgba(0,0,0,.55)";ctx.fillRect(14,14,200,10);
+    ctx.fillStyle="#e4572e";ctx.fillRect(14,14,2*hp,10);
+    ctx.fillStyle="#fff";ctx.font="bold 24px system-ui";ctx.shadowColor="#000";ctx.shadowBlur=6;
+    ctx.fillText("Wave "+wave+"   Score "+score,14,52);ctx.shadowBlur=0;
+    if(recorder&&recorder.state==="recording")return requestAnimationFrame(frame);
+    msg.textContent=(demo?"Demo map. Allow location to play in your area. ":"")+(hasCompass?"":"No compass: use the Turn buttons. ");
+  }
+  requestAnimationFrame(frame);
+}
+$("start").onclick=async()=>{
+  $("start").disabled=true;
+  try{
+    if(!inited){
+      msg.textContent="Loading hand tracking…";
+      await startOri();startGPS();await loadModel();await openCam();
+      inited=true;
+      ["left","right","flip","rec"].forEach(id=>$(id).disabled=false);
+    }
+    $("intro").style.display="none";
+    reset();running=true;prevT=performance.now();frame();
+  }catch(e){
+    msg.textContent="Could not start: "+(e.message||e)+". Allow camera access and use the https link.";
+    $("start").disabled=false;
+  }
+};
+$("flip").onclick=async()=>{facing=facing==="user"?"environment":"user";running=false;await openCam();running=true;frame()};
+$("rec").onclick=()=>{
+  if(recorder&&recorder.state==="recording"){recorder.stop();return}
+  chunks=[];
+  const mime=["video/mp4","video/webm;codecs=vp9","video/webm"].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||"";
+  recorder=new MediaRecorder(cv.captureStream(30),mime?{mimeType:mime}:{});
+  recorder.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  recorder.onstop=()=>{
+    const blob=new Blob(chunks,{type:recorder.mimeType||"video/webm"}),url=URL.createObjectURL(blob);
+    preview.src=url;preview.style.display="block";cv.style.display="none";
+    $("dl").href=url;$("dl").download="the-hand-clip."+(blob.type.includes("mp4")?"mp4":"webm");
+    $("dl").style.display="";$("again").style.display="";
+    $("rec").style.display="none";$("flip").style.display="none";
+    running=false;msg.textContent="Clip ready. Save it or play again.";
+  };
+  recorder.start();$("rec").textContent="Stop";$("rec").classList.add("rec");msg.textContent="Recording…";
+};
+$("again").onclick=()=>{
+  preview.style.display="none";cv.style.display="";
+  $("dl").style.display="none";$("again").style.display="none";
+  $("rec").style.display="";$("flip").style.display="";$("rec").textContent="Record";$("rec").classList.remove("rec");
+  running=true;prevT=performance.now();frame();
+};
+msg.textContent="Tap Start game.";
+</script>
+</body>
+</html>
